@@ -65,11 +65,7 @@ pub struct Stats {
 
 impl Stats {
     pub fn loss_percent(&self) -> usize {
-        if self.sent == 0 {
-            0
-        } else {
-            self.lost * 100 / self.sent
-        }
+        (self.lost * 100).checked_div(self.sent).unwrap_or(0)
     }
 
     /// True when the host never answered at all.
