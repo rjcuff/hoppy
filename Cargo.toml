@@ -1,0 +1,27 @@
+[package]
+name = "hoppy"
+version = "0.1.0"
+edition = "2024"
+description = "A friendlier ifconfig, netstat, and ping. See which adapter is on which network, what's listening, and where your connection is broken."
+rust-version = "1.85"
+authors = ["Ryan Cuff"]
+exclude = [".github/", "assets/", "install.sh", ".gitattributes"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/rjcuff/hoppy"
+homepage = "https://github.com/rjcuff/hoppy"
+keywords = ["network", "cli", "ports", "diagnostics", "netstat"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+listeners = "0.6.1"
+netdev = "0.46.3"
+owo-colors = "4.4.0"
+
+# Small binary, instant startup.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
