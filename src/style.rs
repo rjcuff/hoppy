@@ -5,13 +5,32 @@ use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static COLOR: AtomicBool = AtomicBool::new(false);
+static JSON: AtomicBool = AtomicBool::new(false);
 
-/// Decide once, at startup, whether this run uses color.
-pub fn init(no_color_flag: bool) {
+/// Decide once, at startup, whether this run uses color, and whether it
+/// prints JSON instead of text.
+pub fn init(no_color_flag: bool, json: bool) {
     let env = std::env::var("NO_COLOR").ok();
     let tty = std::io::stdout().is_terminal();
-    let on = should_color(no_color_flag, env.as_deref(), tty) && enable_ansi();
+    let on = !json && should_color(no_color_flag, env.as_deref(), tty) && enable_ansi();
     COLOR.store(on, Ordering::Relaxed);
+    JSON.store(json, Ordering::Relaxed);
+}
+
+/// True when `--json` was passed: commands print one JSON document and no
+/// human text.
+pub fn json_on() -> bool {
+    JSON.load(Ordering::Relaxed)
+}
+
+/// Print a JSON document, indented so it's readable without `jq`.
+pub fn emit(value: &serde_json::Value) {
+    say(&format!("{value:#}"));
+}
+
+/// Print a JSON value on one line, for commands that stream (`hoppy watch`).
+pub fn emit_line(value: &serde_json::Value) {
+    say(&value.to_string());
 }
 
 /// Color only on a terminal, without `--no-color`, and with `NO_COLOR` unset
@@ -51,7 +70,8 @@ fn enable_ansi() -> bool {
     true
 }
 
-fn color_on() -> bool {
+/// True when ANSI escape codes are safe to print (color, cursor movement).
+pub fn color_on() -> bool {
     COLOR.load(Ordering::Relaxed)
 }
 

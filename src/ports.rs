@@ -1,7 +1,8 @@
 //! `hoppy ports` and `hoppy port <n>`: what is listening, and who owns a port.
 
 use crate::net::port_label;
-use crate::style::{bold, cyan, dim, green, red, say, table, yellow};
+use crate::style::{bold, cyan, dim, emit, green, json_on, red, say, table, yellow};
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::net::IpAddr;
@@ -40,6 +41,15 @@ impl Reach {
         }
     }
 
+    /// Stable name for `--json`.
+    fn key(self) -> &'static str {
+        match self {
+            Reach::ThisMachine => "this-machine",
+            Reach::OneInterface => "one-interface",
+            Reach::WholeNetwork => "whole-network",
+        }
+    }
+
     fn colored(self) -> String {
         match self {
             Reach::ThisMachine => dim(self.label()),
@@ -57,6 +67,30 @@ pub struct PortRow {
     pub process: String,
     pub pid: u32,
     pub reach: Reach,
+}
+
+impl PortRow {
+    pub fn to_json(&self) -> serde_json::Value {
+        json!({
+            "port": self.port,
+            "proto": self.proto.label(),
+            "process": self.process,
+            "pid": self.pid,
+            "reach": self.reach.key(),
+            "label": port_label(self.port),
+        })
+    }
+}
+
+/// Does a row match what the user typed? A number matches the port exactly;
+/// anything else is searched for in the process name and the port's label.
+pub fn matches(row: &PortRow, filter: &str) -> bool {
+    let needle = filter.trim().trim_start_matches(':').to_lowercase();
+    if let Ok(port) = needle.parse::<u16>() {
+        return row.port == port;
+    }
+    row.process.to_lowercase().contains(&needle)
+        || port_label(row.port).is_some_and(|label| label.to_lowercase().contains(&needle))
 }
 
 /// Translate a listen address into who can reach it.
@@ -152,11 +186,26 @@ fn print_rows(rows: &[PortRow]) {
     }
 }
 
-/// `hoppy ports [--udp]`
-pub fn run_list(include_udp: bool) -> Result<(), String> {
-    let rows = load(include_udp)?;
+/// `hoppy ports [filter] [--udp] [--exposed]`
+pub fn run_list(include_udp: bool, filter: Option<&str>, exposed: bool) -> Result<(), String> {
+    let all = load(include_udp)?;
+    let total = all.len();
+    let rows: Vec<PortRow> = all
+        .into_iter()
+        .filter(|row| filter.is_none_or(|f| matches(row, f)))
+        .filter(|row| !exposed || row.reach != Reach::ThisMachine)
+        .collect();
+
+    if json_on() {
+        emit(&rows.iter().map(PortRow::to_json).collect());
+        return Ok(());
+    }
     if rows.is_empty() {
-        say("Nothing is listening on this machine.");
+        say(match (total, filter, exposed) {
+            (0, _, _) => "Nothing is listening on this machine.",
+            (_, None, true) => "Nothing here is reachable from the network.",
+            _ => "Nothing listening matches that.",
+        });
         return Ok(());
     }
 
@@ -168,13 +217,34 @@ pub fn run_list(include_udp: bool) -> Result<(), String> {
     } else {
         "hoppy port <n> to inspect one · --udp to include UDP"
     };
-    say(&dim(&format!("  {} listening · {hint}", rows.len())));
+    let count = if rows.len() == total {
+        format!("{total} listening")
+    } else {
+        format!("{} of {total} listening", rows.len())
+    };
+    say(&dim(&format!("  {count} · {hint}")));
     Ok(())
 }
 
 /// `hoppy port <n> [--kill] [-y]`
 pub fn run_port(port: u16, kill: bool, yes: bool) -> Result<(), String> {
     let rows: Vec<PortRow> = load(true)?.into_iter().filter(|r| r.port == port).collect();
+
+    if json_on() {
+        if kill {
+            return Err(
+                "--kill prints progress as it goes, so it can't be combined with --json."
+                    .to_string(),
+            );
+        }
+        emit(&json!({
+            "port": port,
+            "free": rows.is_empty(),
+            "label": port_label(port),
+            "listeners": rows.iter().map(PortRow::to_json).collect::<Vec<_>>(),
+        }));
+        return Ok(());
+    }
 
     if rows.is_empty() {
         say(&format!(
@@ -450,6 +520,27 @@ mod tests {
         assert!(refuse_to_kill(0, 500).is_some());
         assert!(refuse_to_kill(500, 500).is_some());
         assert!(refuse_to_kill(1234, 500).is_none());
+    }
+
+    #[test]
+    fn filter_matches_port_process_or_label() {
+        let mut node = row(3000, Proto::Tcp, 1, Reach::WholeNetwork);
+        node.process = "Node".to_string();
+        assert!(matches(&node, "3000"));
+        assert!(matches(&node, ":3000"));
+        assert!(!matches(&node, "300"));
+        assert!(matches(&node, "node"));
+        assert!(matches(&node, "dev server"));
+        assert!(!matches(&node, "postgres"));
+    }
+
+    #[test]
+    fn json_rows_use_stable_keys() {
+        let value = row(22, Proto::Tcp, 7, Reach::WholeNetwork).to_json();
+        assert_eq!(value["port"], 22);
+        assert_eq!(value["proto"], "tcp");
+        assert_eq!(value["reach"], "whole-network");
+        assert_eq!(value["label"], "ssh");
     }
 
     #[test]

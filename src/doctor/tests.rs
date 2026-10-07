@@ -289,3 +289,9 @@ fn millis_never_prints_zero() {
     assert_eq!(millis(Duration::from_micros(300)), "<1 ms");
     assert_eq!(millis(Duration::from_millis(14)), "14 ms");
 }
+
+#[test]
+fn json_milliseconds_keep_one_decimal() {
+    assert_eq!(ms(Duration::from_micros(1250)), 1.3);
+    assert_eq!(ms(Duration::from_millis(14)), 14.0);
+}

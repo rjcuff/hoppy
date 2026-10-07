@@ -1,8 +1,8 @@
 //! `hoppy` with no arguments: the network at a glance.
 
-use crate::net::{self, Iface, port_label};
+use crate::net::{self, Iface, dns_servers, port_label};
 use crate::ports::{self, PortRow, Reach};
-use crate::style::{bold, cyan, dim, green, say, table, yellow};
+use crate::style::{bold, cyan, dim, emit, green, json_on, say, table, yellow};
 use std::net::IpAddr;
 
 /// How many listening ports the overview shows before pointing at
@@ -19,6 +19,17 @@ pub fn run(show_all: bool) -> Result<(), String> {
     let all = net::load_interfaces();
     let live: Vec<Iface> = all.iter().filter(|i| i.is_interesting()).cloned().collect();
     let shown: &[Iface] = if show_all { &all } else { &live };
+
+    if json_on() {
+        let listening = ports::load(false).unwrap_or_default();
+        emit(&serde_json::json!({
+            "interfaces": shown.iter().map(Iface::to_json).collect::<Vec<_>>(),
+            "dns": dns_servers(&live).iter().map(IpAddr::to_string).collect::<Vec<_>>(),
+            "listening": listening.iter().map(PortRow::to_json).collect::<Vec<_>>(),
+            "warnings": net::warnings(&live),
+        }));
+        return Ok(());
+    }
 
     say("");
     if shown.is_empty() {
@@ -58,7 +69,7 @@ pub fn run(show_all: bool) -> Result<(), String> {
         )));
     }
     say(&dim(
-        "  More: hoppy ports · hoppy port <n> · hoppy doctor [target]",
+        "  More: hoppy ports · hoppy scan · hoppy doctor · hoppy --help",
     ));
     Ok(())
 }
@@ -104,26 +115,6 @@ fn interface_rows(ifaces: &[Iface]) -> Vec<Vec<String>> {
         }
     }
     rows
-}
-
-/// DNS servers across live interfaces, in interface order, no repeats.
-fn dns_servers(ifaces: &[Iface]) -> Vec<IpAddr> {
-    let mut seen = Vec::new();
-    for ip in ifaces.iter().flat_map(|i| &i.dns) {
-        if !is_placeholder_dns(ip) && !seen.contains(ip) {
-            seen.push(*ip);
-        }
-    }
-    seen
-}
-
-/// Windows lists `fec0:0:0:ffff::1..3` on adapters with no real IPv6 DNS.
-/// They're long-deprecated "site-local" defaults that never answer.
-fn is_placeholder_dns(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfec0,
-        IpAddr::V4(_) => false,
-    }
 }
 
 /// Pick the listeners most worth a glance: well-known ports before

@@ -49,6 +49,8 @@ pub struct Iface {
     pub ipv4: Vec<Ipv4Net>,
     pub gateway: Option<Ipv4Addr>,
     pub dns: Vec<IpAddr>,
+    /// Hardware (MAC) address, when the adapter has one.
+    pub mac: Option<[u8; 6]>,
     /// True for the interface that carries the default route.
     pub is_default: bool,
     pub up: bool,
@@ -60,6 +62,55 @@ impl Iface {
     pub fn is_interesting(&self) -> bool {
         self.up && !self.loopback && !self.ipv4.is_empty()
     }
+
+    /// The first address that isn't self-assigned, if any.
+    pub fn real_ipv4(&self) -> Option<&Ipv4Net> {
+        self.ipv4.iter().find(|net| !is_self_assigned(net.addr()))
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "kind": self.kind.label(),
+            "ipv4": self.ipv4.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "gateway": self.gateway.map(|gw| gw.to_string()),
+            "mac": self.mac.map(crate::oui::format_mac),
+            "default": self.is_default,
+            "up": self.up,
+        })
+    }
+}
+
+/// DNS servers across the given interfaces, in interface order, no repeats.
+pub fn dns_servers(ifaces: &[Iface]) -> Vec<IpAddr> {
+    let mut seen = Vec::new();
+    for ip in ifaces.iter().flat_map(|i| &i.dns) {
+        if !is_placeholder_dns(ip) && !seen.contains(ip) {
+            seen.push(*ip);
+        }
+    }
+    seen
+}
+
+/// Windows lists `fec0:0:0:ffff::1..3` on adapters with no real IPv6 DNS.
+/// They're long-deprecated "site-local" defaults that never answer.
+fn is_placeholder_dns(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfec0,
+        IpAddr::V4(_) => false,
+    }
+}
+
+/// DNS servers hoppy can send a query to itself. Link-local IPv6 servers
+/// (`fe80::...`) only work with a zone attached, so they're left out.
+pub fn queryable_dns(ifaces: &[Iface]) -> Vec<IpAddr> {
+    dns_servers(ifaces)
+        .into_iter()
+        .filter(|ip| match ip {
+            IpAddr::V4(_) => true,
+            IpAddr::V6(v6) => !v6.is_unicast_link_local(),
+        })
+        .collect()
 }
 
 /// Read every interface from the OS, most important first: the default-route
@@ -103,6 +154,11 @@ fn from_netdev(raw: &netdev::Interface) -> Iface {
         ipv4: raw.ipv4.clone(),
         gateway: raw.gateway.as_ref().and_then(|gw| gw.ipv4.first().copied()),
         dns: raw.dns_servers.clone(),
+        mac: raw
+            .mac_addr
+            .as_ref()
+            .map(|mac| mac.octets())
+            .filter(|octets| *octets != [0; 6]),
         is_default: raw.default,
         up: raw.is_up() && !link_dead,
         loopback: raw.is_loopback(),
@@ -323,6 +379,7 @@ pub(crate) mod tests {
             ipv4: ipv4.iter().map(|s| s.parse().unwrap()).collect(),
             gateway: gateway.map(|g| g.parse().unwrap()),
             dns: Vec::new(),
+            mac: None,
             is_default: false,
             up: true,
             loopback: false,

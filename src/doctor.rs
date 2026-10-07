@@ -4,7 +4,8 @@
 //! connection still proves the host is alive.
 
 use crate::net::{self, Iface, Kind, is_self_assigned};
-use crate::style::{bold, dim, green, red, say, yellow};
+use crate::style::{bold, dim, emit, green, json_on, red, say, yellow};
+use serde_json::json;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc;
@@ -12,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Ports a home/office router usually answers on: DNS, and its admin page.
-const ROUTER_PORTS: [u16; 3] = [53, 80, 443];
+pub(crate) const ROUTER_PORTS: [u16; 3] = [53, 80, 443];
 /// Windows retries a refused connect for about a second before reporting it,
 /// so the timeout has to be longer than that.
 const ROUTER_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -36,7 +37,7 @@ pub struct Target {
 }
 
 impl Target {
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         if self.host.contains(':') {
             format!("[{}]:{}", self.host, self.port)
         } else {
@@ -44,7 +45,7 @@ impl Target {
         }
     }
 
-    fn ip(&self) -> Option<IpAddr> {
+    pub(crate) fn ip(&self) -> Option<IpAddr> {
         self.host.parse().ok()
     }
 }
@@ -149,7 +150,7 @@ pub fn classify(result: &io::Result<()>, elapsed: Duration) -> Probe {
     }
 }
 
-fn tcp_probe(addr: SocketAddr, timeout: Duration) -> Probe {
+pub(crate) fn tcp_probe(addr: SocketAddr, timeout: Duration) -> Probe {
     let start = Instant::now();
     let result = TcpStream::connect_timeout(&addr, timeout).map(drop);
     classify(&result, start.elapsed())
@@ -157,7 +158,7 @@ fn tcp_probe(addr: SocketAddr, timeout: Duration) -> Probe {
 
 /// Probe several ports on one host at once and return the fastest sign of
 /// life, so a silent host costs one timeout instead of one per port.
-fn probe_any(ip: IpAddr, ports: &[u16], timeout: Duration) -> Option<Duration> {
+pub(crate) fn probe_any(ip: IpAddr, ports: &[u16], timeout: Duration) -> Option<Duration> {
     let (tx, rx) = mpsc::channel();
     for &port in ports {
         let tx = tx.clone();
@@ -170,7 +171,11 @@ fn probe_any(ip: IpAddr, ports: &[u16], timeout: Duration) -> Option<Duration> {
 }
 
 /// Resolve a name with a timeout. The OS resolver has none of its own.
-fn resolve(host: &str, port: u16, timeout: Duration) -> Option<(Vec<SocketAddr>, Duration)> {
+pub(crate) fn resolve(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Option<(Vec<SocketAddr>, Duration)> {
     let (tx, rx) = mpsc::channel();
     let host = host.to_string();
     let start = Instant::now();
@@ -324,46 +329,82 @@ pub fn verdict(f: &Findings, target: Option<&str>) -> String {
     }
 }
 
-fn millis(t: Duration) -> String {
+pub(crate) fn millis(t: Duration) -> String {
     match t.as_millis() {
         0 => "<1 ms".to_string(),
         ms => format!("{ms} ms"),
     }
 }
 
-/// Print one step: mark, name, detail, and latency if there is one.
-fn step(mark: &str, name: &str, detail: &str, latency: Option<Duration>) {
-    let name = crate::style::pad(&bold(name), 9);
-    let latency = latency.map_or_else(String::new, |t| dim(&format!("  {}", millis(t))));
-    say(&format!("  {mark} {name}  {detail}{latency}"));
+/// Milliseconds to one decimal place, for JSON output.
+pub(crate) fn ms(t: Duration) -> f64 {
+    (t.as_secs_f64() * 10_000.0).round() / 10.0
 }
 
-fn ok() -> String {
-    green("✓")
+/// How one step of the checkup went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Ok,
+    /// Inconclusive: worth showing, not worth failing over.
+    Unsure,
+    Fail,
 }
 
-fn fail() -> String {
-    red("✗")
+impl Mark {
+    fn symbol(self) -> String {
+        match self {
+            Mark::Ok => green("✓"),
+            Mark::Unsure => yellow("?"),
+            Mark::Fail => red("✗"),
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Mark::Ok => "ok",
+            Mark::Unsure => "unsure",
+            Mark::Fail => "fail",
+        }
+    }
 }
 
-fn check_router(gateway: Option<Ipv4Addr>) -> Router {
+/// Prints each step as it finishes and keeps a copy for `--json`.
+#[derive(Default)]
+struct Report {
+    steps: Vec<serde_json::Value>,
+}
+
+impl Report {
+    /// Record one step: mark, name, detail, and latency if there is one.
+    fn step(&mut self, mark: Mark, name: &str, detail: &str, latency: Option<Duration>) {
+        self.steps.push(json!({
+            "name": name,
+            "status": mark.key(),
+            "detail": detail,
+            "ms": latency.map(ms),
+        }));
+        if json_on() {
+            return;
+        }
+        let name = crate::style::pad(&bold(name), 9);
+        let latency = latency.map_or_else(String::new, |t| dim(&format!("  {}", millis(t))));
+        say(&format!("  {} {name}  {detail}{latency}", mark.symbol()));
+    }
+}
+
+fn check_router(report: &mut Report, gateway: Option<Ipv4Addr>) -> Router {
     let Some(gw) = gateway else {
-        step(
-            &fail(),
-            "router",
-            "no gateway on this network",
-            None::<Duration>,
-        );
+        report.step(Mark::Fail, "router", "no gateway on this network", None);
         return Router::Missing;
     };
     match probe_any(IpAddr::V4(gw), &ROUTER_PORTS, ROUTER_TIMEOUT) {
         Some(t) => {
-            step(&ok(), "router", &format!("{gw} answered"), Some(t));
+            report.step(Mark::Ok, "router", &format!("{gw} answered"), Some(t));
             Router::Answered
         }
         None => {
-            step(
-                &yellow("?"),
+            report.step(
+                Mark::Unsure,
                 "router",
                 &format!("{gw} didn't answer (some routers ignore probes), carrying on"),
                 None,
@@ -373,16 +414,16 @@ fn check_router(gateway: Option<Ipv4Addr>) -> Router {
     }
 }
 
-fn check_internet() -> bool {
+fn check_internet(report: &mut Report) -> bool {
     for ip in INTERNET_PROBES {
         let addr = SocketAddr::new(IpAddr::V4(ip), 443);
         if let Some(t) = tcp_probe(addr, INTERNET_TIMEOUT).alive() {
-            step(&ok(), "internet", &format!("reached {ip}"), Some(t));
+            report.step(Mark::Ok, "internet", &format!("reached {ip}"), Some(t));
             return true;
         }
     }
-    step(
-        &fail(),
+    report.step(
+        Mark::Fail,
         "internet",
         "couldn't reach 1.1.1.1 or 8.8.8.8",
         None,
@@ -392,18 +433,18 @@ fn check_internet() -> bool {
 
 /// Resolve the target's name (or example.com when the target is an IP or
 /// absent). Returns the addresses found, if any.
-fn check_dns(target: Option<&Target>) -> Option<Vec<SocketAddr>> {
+fn check_dns(report: &mut Report, target: Option<&Target>) -> Option<Vec<SocketAddr>> {
     let named = target.filter(|t| t.ip().is_none());
     let (name, port) = named.map_or((DEFAULT_DNS_NAME, DEFAULT_PORT), |t| (&t.host, t.port));
 
     match resolve(name, port, DNS_TIMEOUT) {
         Some((addrs, t)) => {
             let first = addrs[0].ip();
-            step(&ok(), "dns", &format!("{name} is {first}"), Some(t));
+            report.step(Mark::Ok, "dns", &format!("{name} is {first}"), Some(t));
             Some(addrs)
         }
         None => {
-            step(&fail(), "dns", &format!("couldn't look up {name}"), None);
+            report.step(Mark::Fail, "dns", &format!("couldn't look up {name}"), None);
             None
         }
     }
@@ -411,15 +452,19 @@ fn check_dns(target: Option<&Target>) -> Option<Vec<SocketAddr>> {
 
 /// Connect to the target. `resolved` holds DNS results when the target is a
 /// name; a bare IP needs no lookup.
-fn check_target(target: &Target, resolved: Option<&[SocketAddr]>) -> TargetState {
+fn check_target(
+    report: &mut Report,
+    target: &Target,
+    resolved: Option<&[SocketAddr]>,
+) -> TargetState {
     let label = target.label();
     let candidates: Vec<SocketAddr> = match target.ip() {
         Some(ip) => vec![SocketAddr::new(ip, target.port)],
         None => resolved.map(<[SocketAddr]>::to_vec).unwrap_or_default(),
     };
     if candidates.is_empty() {
-        step(
-            &fail(),
+        report.step(
+            Mark::Fail,
             "target",
             &format!("{label} has no address to try"),
             None,
@@ -435,7 +480,7 @@ fn check_target(target: &Target, resolved: Option<&[SocketAddr]>) -> TargetState
     for addr in ordered.iter().take(MAX_TARGET_ADDRS) {
         match tcp_probe(*addr, TARGET_TIMEOUT) {
             Probe::Open(t) => {
-                step(&ok(), "target", &format!("{label} is open"), Some(t));
+                report.step(Mark::Ok, "target", &format!("{label} is open"), Some(t));
                 return TargetState::Open;
             }
             // One address refusing doesn't settle it: a name can map to
@@ -445,8 +490,8 @@ fn check_target(target: &Target, resolved: Option<&[SocketAddr]>) -> TargetState
         }
     }
     if refused {
-        step(
-            &fail(),
+        report.step(
+            Mark::Fail,
             "target",
             &format!(
                 "{} is up, but nothing is listening on port {}",
@@ -456,7 +501,12 @@ fn check_target(target: &Target, resolved: Option<&[SocketAddr]>) -> TargetState
         );
         return TargetState::Refused;
     }
-    step(&fail(), "target", &format!("{label} didn't answer"), None);
+    report.step(
+        Mark::Fail,
+        "target",
+        &format!("{label} didn't answer"),
+        None,
+    );
     TargetState::Down
 }
 
@@ -467,32 +517,31 @@ pub fn run(target: Option<&str>) -> Result<bool, String> {
     let all = net::load_interfaces();
     let live: Vec<Iface> = all.into_iter().filter(Iface::is_interesting).collect();
     let (link, iface) = check_link(&live);
+    let mut report = Report::default();
 
-    say("");
+    if !json_on() {
+        say("");
+    }
     match (&link, iface) {
         (Link::Ok, Some(i)) => {
-            let ip = i.ipv4.iter().find(|n| !is_self_assigned(n.addr()));
-            let ip = ip.map_or_else(String::new, |n| n.addr().to_string());
-            step(
-                &ok(),
-                "connected",
-                &format!("{} has {ip}", i.name),
-                None::<Duration>,
-            );
+            let ip = i
+                .real_ipv4()
+                .map_or_else(String::new, |n| n.addr().to_string());
+            report.step(Mark::Ok, "connected", &format!("{} has {ip}", i.name), None);
         }
-        (Link::NoGateway(name), _) => step(
-            &yellow("?"),
+        (Link::NoGateway(name), _) => report.step(
+            Mark::Unsure,
             "connected",
             &format!("{name} has an address but no gateway"),
             None,
         ),
-        (Link::SelfAssigned(name), _) => step(
-            &fail(),
+        (Link::SelfAssigned(name), _) => report.step(
+            Mark::Fail,
             "connected",
             &format!("{name} only has a self-assigned 169.254 address"),
             None,
         ),
-        _ => step(&fail(), "connected", "no network connection", None),
+        _ => report.step(Mark::Fail, "connected", "no network connection", None),
     }
 
     let mut findings = Findings {
@@ -506,21 +555,30 @@ pub fn run(target: Option<&str>) -> Result<bool, String> {
     // With no usable address nothing further can work, so stop at the cause.
     let usable = matches!(findings.link, Link::Ok | Link::NoGateway(_));
     if usable {
-        findings.router = check_router(iface.and_then(|i| i.gateway));
-        findings.internet = check_internet();
-        let resolved = check_dns(target.as_ref());
+        findings.router = check_router(&mut report, iface.and_then(|i| i.gateway));
+        findings.internet = check_internet(&mut report);
+        let resolved = check_dns(&mut report, target.as_ref());
         findings.dns = resolved.is_some();
         if let Some(t) = &target {
-            findings.target = Some(check_target(t, resolved.as_deref()));
+            findings.target = Some(check_target(&mut report, t, resolved.as_deref()));
         }
     }
 
     let healthy = findings.healthy();
     let label = target.as_ref().map(Target::label);
     let sentence = verdict(&findings, label.as_deref());
+    if json_on() {
+        emit(&json!({
+            "healthy": healthy,
+            "verdict": sentence,
+            "target": label,
+            "steps": report.steps,
+        }));
+        return Ok(healthy);
+    }
     say("");
-    let mark = if healthy { ok() } else { fail() };
-    say(&format!("  {mark} {}", bold(&sentence)));
+    let mark = if healthy { Mark::Ok } else { Mark::Fail };
+    say(&format!("  {} {}", mark.symbol(), bold(&sentence)));
     Ok(healthy)
 }
 
